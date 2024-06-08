@@ -361,7 +361,7 @@ def eval(model, dataloader, optimizer, criterion, device):
 def main():
     # deviceの設定
     set_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "mps"
 
     # dataloader / model
     transform = transforms.Compose([

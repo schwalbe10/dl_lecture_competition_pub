@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "dl-lecture-competition-pub"
+version = "0.1.0"
+description = ""
+authors = ["schwalbe10 <schwalbe10@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+pillow = "^10.3.0"
+numpy = "^1.26.4"
+pandas = "^2.2.2"
+torch = "^2.3.1"
+torchvision = "^0.18.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
