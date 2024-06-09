@@ -9,7 +9,11 @@ import pandas
 import torch
 import torch.nn as nn
 import torchvision
+import torch.nn.functional as F
 from torchvision import transforms
+from torch.nn.utils.rnn import pad_sequence
+
+from collections import Counter
 
 
 def set_seed(seed):
@@ -84,15 +88,20 @@ class VQADataset(torch.utils.data.Dataset):
                     self.question2idx[word] = len(self.question2idx)
         self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
 
-        if self.answer:
-            # 回答に含まれる単語を辞書に追加
-            for answers in self.df["answers"]:
-                for answer in answers:
-                    word = answer["answer"]
-                    word = process_text(word)
-                    if word not in self.answer2idx:
-                        self.answer2idx[word] = len(self.answer2idx)
-            self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
+        # answerの辞書を作成
+        class_mapping_df = pandas.read_csv("data/class_mapping.csv")
+        self.answer2idx = {row["answer"]: row["class_id"] for _, row in class_mapping_df.iterrows()}
+        self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
+
+        # if self.answer:
+        #     # 回答に含まれる単語を辞書に追加
+        #     for answers in self.df["answers"]:
+        #         for answer in answers:
+        #             word = answer["answer"]
+        #             word = process_text(word)
+        #             if word not in self.answer2idx:
+        #                 self.answer2idx[word] = len(self.answer2idx)
+        #     self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
 
     def update_dict(self, dataset):
         """
@@ -138,11 +147,25 @@ class VQADataset(torch.utils.data.Dataset):
             except KeyError:
                 question[-1] = 1  # 未知語
 
-        if self.answer:
-            answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
-            mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
+        # if self.answer:
+        #     answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
+        #     mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+        #     return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+
+        if self.answer:
+
+            answers = [self.answer2idx.get(process_text(answer["answer"]), -1) for answer in self.df["answers"][idx]]
+            answers = [answer for answer in answers if answer != -1]  # 辞書に存在しない回答を無視
+            answers = torch.tensor([answers], dtype=torch.long)  # リストをTensorに変換
+
+            max_length = 10  # ここでは10に設定していますが、適切な値に変更してください
+            if answers.size(1) < max_length:
+                answers = F.pad(answers, [0, max_length - answers.size(1)])  # パディングを追加してテンソルのサイズを揃える
+
+            mode_answer_idx = mode(answers)[0] if answers.numel() > 0 else -1  # 最頻値を取得（正解ラベル）
+
+            return image, torch.Tensor(question), torch.Tensor(answers), mode_answer_idx
 
         else:
             return image, torch.Tensor(question)
@@ -339,7 +362,7 @@ def train(model, dataloader, optimizer, criterion, device):
 def eval(model, dataloader, optimizer, criterion, device):
     model.eval()
 
-    total_loss = 0
+    # total_loss = 0
     total_acc = 0
     simple_acc = 0
 
