@@ -12,8 +12,9 @@ import torchvision
 import torch.nn.functional as F
 from torchvision import transforms
 from torch.nn.utils.rnn import pad_sequence
-
+from transformers import BertTokenizer, BertModel
 from collections import Counter
+from tqdm import tqdm
 
 
 def set_seed(seed):
@@ -86,12 +87,35 @@ class VQADataset(torch.utils.data.Dataset):
             for word in words:
                 if word not in self.question2idx:
                     self.question2idx[word] = len(self.question2idx)
-        self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
+ 
+        # BERTのトークナイザーとモデルを初期化
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.model = BertModel.from_pretrained('bert-base-uncased')
 
         # answerの辞書を作成
         class_mapping_df = pandas.read_csv("data/class_mapping.csv")
         self.answer2idx = {row["answer"]: row["class_id"] for _, row in class_mapping_df.iterrows()}
         self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
+
+    def get_bert_embeddings(self, sentence):
+        inputs = self.tokenizer(sentence, return_tensors="pt", padding='max_length', max_length=10, truncation=True)
+        outputs = self.model(**inputs)
+        embeddings = outputs.last_hidden_state
+        return embeddings
+
+# class VQADataset(torch.utils.data.Dataset):
+    # def __init__(self, df_path, image_dir, transform=None, answer=True):
+        # self.transform = transform  # 画像の前処理
+        # self.image_dir = image_dir  # 画像ファイルのディレクトリ
+        # self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
+        # self.answer = answer
+# 
+       # self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
+# 
+        # answerの辞書を作成
+        # class_mapping_df = pandas.read_csv("data/class_mapping.csv")
+        # self.answer2idx = {row["answer"]: row["class_id"] for _, row in class_mapping_df.iterrows()}
+        # self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
 
         # if self.answer:
         #     # 回答に含まれる単語を辞書に追加
@@ -118,44 +142,12 @@ class VQADataset(torch.utils.data.Dataset):
         self.idx2answer = dataset.idx2answer
 
     def __getitem__(self, idx):
-        """
-        対応するidxのデータ（画像，質問，回答）を取得．
-
-        Parameters
-        ----------
-        idx : int
-            取得するデータのインデックス
-
-        Returns
-        -------
-        image : torch.Tensor  (C, H, W)
-            画像データ
-        question : torch.Tensor  (vocab_size)
-            質問文をone-hot表現に変換したもの
-        answers : torch.Tensor  (n_answer)
-            10人の回答者の回答のid
-        mode_answer_idx : torch.Tensor  (1)
-            10人の回答者の回答の中で最頻値の回答のid
-        """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        # question_words = self.df["question"][idx].split(" ")
-        question_words = process_text(self.df["question"][idx]).split(" ")  # ここで前処理を行う
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
 
-        # if self.answer:
-        #     answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
-        #     mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
-
-        #     return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+        question = self.get_bert_embeddings(self.df["question"][idx])
 
         if self.answer:
-
             answers = [self.answer2idx.get(process_text(answer["answer"]), -1) for answer in self.df["answers"][idx]]
             answers = [answer for answer in answers if answer != -1]  # 辞書に存在しない回答を無視
             answers = torch.tensor([answers], dtype=torch.long)  # リストをTensorに変換
@@ -166,10 +158,64 @@ class VQADataset(torch.utils.data.Dataset):
 
             mode_answer_idx = mode(answers)[0] if answers.numel() > 0 else -1  # 最頻値を取得（正解ラベル）
 
-            return image, torch.Tensor(question), torch.Tensor(answers), mode_answer_idx
+            return image, question, torch.Tensor(answers), mode_answer_idx
 
         else:
-            return image, torch.Tensor(question)
+            return image, question
+
+    # def __getitem__(self, idx):
+    #     """
+    #     対応するidxのデータ（画像，質問，回答）を取得．
+
+    #     Parameters
+    #     ----------
+    #     idx : int
+    #         取得するデータのインデックス
+
+    #     Returns
+    #     -------
+    #     image : torch.Tensor  (C, H, W)
+    #         画像データ
+    #     question : torch.Tensor  (vocab_size)
+    #         質問文をone-hot表現に変換したもの
+    #     answers : torch.Tensor  (n_answer)
+    #         10人の回答者の回答のid
+    #     mode_answer_idx : torch.Tensor  (1)
+    #         10人の回答者の回答の中で最頻値の回答のid
+    #     """
+    #     image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
+    #     image = self.transform(image)
+    #     question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
+    #     # question_words = self.df["question"][idx].split(" ")
+    #     question_words = process_text(self.df["question"][idx]).split(" ")  # ここで前処理を行う
+    #     for word in question_words:
+    #         try:
+    #             question[self.question2idx[word]] = 1  # one-hot表現に変換
+    #         except KeyError:
+    #             question[-1] = 1  # 未知語
+
+    #     # if self.answer:
+    #     #     answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
+    #     #     mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
+
+    #     #     return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+
+    #     if self.answer:
+
+    #         answers = [self.answer2idx.get(process_text(answer["answer"]), -1) for answer in self.df["answers"][idx]]
+    #         answers = [answer for answer in answers if answer != -1]  # 辞書に存在しない回答を無視
+    #         answers = torch.tensor([answers], dtype=torch.long)  # リストをTensorに変換
+
+    #         max_length = 10  # ここでは10に設定していますが、適切な値に変更してください
+    #         if answers.size(1) < max_length:
+    #             answers = F.pad(answers, [0, max_length - answers.size(1)])  # パディングを追加してテンソルのサイズを揃える
+
+    #         mode_answer_idx = mode(answers)[0] if answers.numel() > 0 else -1  # 最頻値を取得（正解ラベル）
+
+    #         return image, torch.Tensor(question), torch.Tensor(answers), mode_answer_idx
+
+    #     else:
+    #         return image, torch.Tensor(question)
 
     def __len__(self):
         return len(self.df)
@@ -310,27 +356,38 @@ def ResNet18():
 def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
-
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
         self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        self.text_encoder = nn.Linear(768, 512)  # Change input size to 768
 
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(5632, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
 
     def forward(self, image, question):
         image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+        image_feature = image_feature.view(image_feature.size(0), -1)
+
+        question_feature = self.text_encoder(question.mean(dim=1))  # テキストの特徴量
+        question_feature = question_feature.view(question_feature.size(0), -1)
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
 
         return x
+
+    # def forward(self, image, question):
+    #     image_feature = self.resnet(image)  # 画像の特徴量
+    #     question_feature = self.text_encoder(question)  # テキストの特徴量
+
+    #     x = torch.cat([image_feature, question_feature], dim=1)
+    #     x = self.fc(x)
+
+    #     return x
 
 
 # 4. 学習の実装
@@ -342,7 +399,7 @@ def train(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
+    for image, question, answers, mode_answer in tqdm(dataloader):
         image, question, answer, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
@@ -368,7 +425,7 @@ def eval(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
+    for image, question, answers, mode_answer in tqdm(dataloader):
         image, question, answer, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
