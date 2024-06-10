@@ -14,6 +14,8 @@ from torchvision import transforms
 from torch.nn.utils.rnn import pad_sequence
 
 from collections import Counter
+from tqdm import tqdm
+
 
 
 def set_seed(seed):
@@ -341,7 +343,7 @@ def train(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
+    for image, question, answers, mode_answer in tqdm(dataloader):
         image, question, answer, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
@@ -386,10 +388,17 @@ def main():
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "mps"
 
-    # dataloader / model
+    # # dataloader / model
+    # transform = transforms.Compose([
+    #     transforms.Resize((224, 224)),
+    #     transforms.ToTensor()
+    # ])
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.Resize((224, 224)),  # Resize images
+        transforms.RandomHorizontalFlip(),  # Randomly flip images horizontally
+        transforms.RandomRotation(15),  # Randomly rotate images by 15 degrees
+        transforms.ToTensor(),  # Convert images to PyTorch tensors
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # Normalize images
     ])
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
