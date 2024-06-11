@@ -16,6 +16,7 @@ from torch.nn.utils.rnn import pad_sequence
 from collections import Counter
 from tqdm import tqdm
 
+from transformers import BertTokenizer, BertModel
 
 
 def set_seed(seed):
@@ -318,15 +319,29 @@ class VQAModel(nn.Module):
         self.resnet = ResNet18()
         self.text_encoder = nn.Linear(vocab_size, 512)
 
+        # Initialize the tokenizer and the BERT model
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.bert_model = BertModel.from_pretrained('bert-base-uncased')
+
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(1280, 512),
             nn.ReLU(inplace=True),
-            nn.Linear(512, n_answer)
+            nn.Linear(512, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, n_answer)
         )
 
     def forward(self, image, question):
         image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+        image_feature = image_feature.view(image_feature.size(0), -1)
+
+        # Convert each question from tensor of word indices to list of tokens
+        question = [' '.join(self.tokenizer.convert_ids_to_tokens([int(q) for q in question_single.tolist()])) for question_single in question]
+
+        # Tokenize and encode question
+        inputs = self.tokenizer(question, return_tensors="pt", padding=True, truncation=True, max_length=5).to(image.device)
+        outputs = self.bert_model(**inputs)
+        question_feature = outputs.last_hidden_state.mean(dim=1)  # テキストの特徴量
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
