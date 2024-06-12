@@ -314,7 +314,9 @@ class VQAModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(512, 1024),
             nn.ReLU(inplace=True),
-            nn.Linear(1024, n_answer)
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, n_answer)
         )
 
     def forward(self, image, question):
@@ -416,7 +418,7 @@ def main():
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
               f"train loss: {train_loss:.4f}\n"
-              f"train acc: {train_acc:.4f})
+              f"train acc: {train_acc:.4f}"
             #   f"train simple acc: {train_simple_acc:.4f}"
               )
 
