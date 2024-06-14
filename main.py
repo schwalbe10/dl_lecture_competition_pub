@@ -257,6 +257,7 @@ class ResNet(nn.Module):
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.dropout = nn.Dropout(p=0.5)
 
         self.layer1 = self._make_layer(block, layers[0], 64)
         self.layer2 = self._make_layer(block, layers[1], 128, stride=2)
@@ -280,8 +281,11 @@ class ResNet(nn.Module):
         x = self.maxpool(x)
 
         x = self.layer1(x)
+        x = self.dropout(x)
         x = self.layer2(x)
+        x = self.dropout(x)
         x = self.layer3(x)
+        x = self.dropout(x)
         x = self.layer4(x)
 
         x = self.avgpool(x)
@@ -302,7 +306,7 @@ def ResNet50():
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        self.resnet = ResNet50()
+        self.resnet = ResNet18()
         self.text_encoder = nn.Linear(vocab_size, 512)
 
         # Initialize the tokenizer and the BERT model
@@ -410,7 +414,8 @@ def main():
     # optimizer / criterion
     num_epoch = 20
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
 
     # train model
     for epoch in range(num_epoch):
@@ -421,6 +426,7 @@ def main():
               f"train acc: {train_acc:.4f}"
             #   f"train simple acc: {train_simple_acc:.4f}"
               )
+        scheduler.step()
 
     # 提出用ファイルの作成
     model.eval()
