@@ -18,6 +18,8 @@ from tqdm import tqdm
 
 from transformers import BertTokenizer, BertModel
 
+from torchvision.models import vgg16, vgg
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -257,7 +259,7 @@ class ResNet(nn.Module):
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.dropout = nn.Dropout(p=0.5)
+        # self.dropout = nn.Dropout(p=0.5)
 
         self.layer1 = self._make_layer(block, layers[0], 64)
         self.layer2 = self._make_layer(block, layers[1], 128, stride=2)
@@ -281,11 +283,11 @@ class ResNet(nn.Module):
         x = self.maxpool(x)
 
         x = self.layer1(x)
-        x = self.dropout(x)
+        # x = self.dropout(x)
         x = self.layer2(x)
-        x = self.dropout(x)
+        # x = self.dropout(x)
         x = self.layer3(x)
-        x = self.dropout(x)
+        # x = self.dropout(x)
         x = self.layer4(x)
 
         x = self.avgpool(x)
@@ -306,7 +308,7 @@ def ResNet50():
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        self.resnet = ResNet18()
+        
         self.text_encoder = nn.Linear(vocab_size, 512)
 
         # Initialize the tokenizer and the BERT model
@@ -314,7 +316,7 @@ class VQAModel(nn.Module):
         self.bert_model = BertModel.from_pretrained('bert-base-uncased')
 
         self.fc = nn.Sequential(
-            nn.Linear(1280, 512),
+            nn.Linear(1768, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, 1024),
             nn.ReLU(inplace=True),
@@ -324,7 +326,7 @@ class VQAModel(nn.Module):
         )
 
     def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
+        image_feature = self.vgg(image)  # 画像の特徴量
         image_feature = image_feature.view(image_feature.size(0), -1)
 
         # Convert each question from tensor of word indices to list of tokens
