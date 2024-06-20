@@ -17,9 +17,10 @@ from collections import Counter
 from tqdm import tqdm
 
 from transformers import BertTokenizer, BertModel
-
 from torchvision.models import vgg16, vgg
 
+from torchvision.models import resnet50
+from torchvision.models.resnet import resnet50, ResNet50_Weights
 
 def set_seed(seed):
     random.seed(seed)
@@ -308,25 +309,25 @@ def ResNet50():
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        self.resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)  # Use weights instead of pretrained
+        self.resnet.fc = nn.Linear(self.resnet.fc.in_features, n_answer)  # Adjust final layer
 
         # Initialize the tokenizer and the BERT model
         self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
         self.bert_model = BertModel.from_pretrained('bert-base-uncased')
 
         self.fc = nn.Sequential(
-            nn.Linear(1768, 512),
+            nn.Linear(41792, 16384),
             nn.ReLU(inplace=True),
-            nn.Linear(512, 1024),
+            nn.Linear(16384, 32768),
             nn.ReLU(inplace=True),
-            nn.Linear(1024, 512),
+            nn.Linear(32768, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
 
     def forward(self, image, question):
-        image_feature = self.vgg(image)  # 画像の特徴量
+        image_feature = self.resnet(image)  # 画像の特徴量
         image_feature = image_feature.view(image_feature.size(0), -1)
 
         # Convert each question from tensor of word indices to list of tokens
@@ -414,10 +415,10 @@ def main():
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 10
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
     # train model
     for epoch in range(num_epoch):
