@@ -17,10 +17,8 @@ from collections import Counter
 from tqdm import tqdm
 
 from transformers import BertTokenizer, BertModel
-from torchvision.models import vgg16, vgg
-
 from torchvision.models import resnet50
-from torchvision.models.resnet import resnet50, ResNet50_Weights
+from transformers import CLIPProcessor, CLIPModel
 
 def set_seed(seed):
     random.seed(seed)
@@ -157,10 +155,12 @@ class VQADataset(torch.utils.data.Dataset):
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+            # return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+            return image, question, torch.Tensor(answers), int(mode_answer_idx)
 
         else:
-            return image, torch.Tensor(question)
+            # return image, torch.Tensor(question)
+            return image, question
 
     def __len__(self):
         return len(self.df)
@@ -307,45 +307,67 @@ def ResNet50():
 
 
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, device, train_dataset):
         super().__init__()
-        self.resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)  # Use weights instead of pretrained
-        self.resnet.fc = nn.Linear(self.resnet.fc.in_features, n_answer)  # Adjust final layer
-
-        # Initialize the tokenizer and the BERT model
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-        self.bert_model = BertModel.from_pretrained('bert-base-uncased')
-
-        self.fc = nn.Sequential(
-            nn.Linear(41792, 16384),
-            nn.ReLU(inplace=True),
-            nn.Linear(16384, 32768),
-            nn.ReLU(inplace=True),
-            nn.Linear(32768, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, n_answer)
-        )
+        self.device = device
+        self.train_dataset = train_dataset
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
     def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
-        image_feature = image_feature.view(image_feature.size(0), -1)
+        image = torch.clamp(image, 0, 1)  # Clip image data to [0, 1]
 
+        if isinstance(question[0], str):
+            # If questions are already strings, use them directly
+            processed_questions = question
+        else:
+            # If questions are tensors of indices, convert them to strings
+            processed_questions = [' '.join([self.train_dataset.idx2question.get(int(idx), '[UNK]') for idx in q if idx != 0]) for q in question]
+        inputs = self.processor(text=processed_questions, images=image, return_tensors="pt", padding=True, truncation=True, max_length=77, do_rescale=False)
+        inputs = {name: tensor.to(self.device) for name, tensor in inputs.items()}  # Move inputs to the same device as the model
+        outputs = self.clip_model(**inputs)
+        return outputs.logits_per_image  # Extract the logits per image tensor
+
+# class VQAModel(nn.Module):
+    # def __init__(self, vocab_size: int, n_answer: int):
+        # super().__init__()
+        # self.resnet = resnet50(pretrained=True)
+        # self.text_encoder = nn.Linear(vocab_size, 512)
+# 
+        # Initialize the tokenizer and the BERT model
+        # self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        # self.bert_model = BertModel.from_pretrained('bert-base-uncased')
+# 
+        # self.fc = nn.Sequential(
+            # nn.Linear(1768, 512),
+            # nn.ReLU(inplace=True),
+            # nn.Linear(512, 1024),
+            # nn.ReLU(inplace=True),
+            # nn.Linear(1024, 512),
+            # nn.ReLU(inplace=True),
+            # nn.Linear(512, n_answer)
+        # )
+# 
+    # def forward(self, image, question):
+        # image_feature = self.resnet(image)  # 画像の特徴量
+        # image_feature = image_feature.view(image_feature.size(0), -1)
+# 
         # Convert each question from tensor of word indices to list of tokens
-        question = [' '.join(self.tokenizer.convert_ids_to_tokens([int(q) for q in question_single.tolist()])) for question_single in question]
-
+        # question = [' '.join(self.tokenizer.convert_ids_to_tokens([int(q) for q in question_single.tolist()])) for question_single in question]
+# 
         # Tokenize and encode question
-        inputs = self.tokenizer(question, return_tensors="pt", padding=True, truncation=True, max_length=5).to(image.device)
-        outputs = self.bert_model(**inputs)
-        question_feature = outputs.last_hidden_state.mean(dim=1)  # テキストの特徴量
-
-        x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(x)
-
-        return x
+        # inputs = self.tokenizer(question, return_tensors="pt", padding=True, truncation=True, max_length=5).to(image.device)
+        # outputs = self.bert_model(**inputs)
+        # question_feature = outputs.last_hidden_state.mean(dim=1)  # テキストの特徴量
+# 
+        # x = torch.cat([image_feature, question_feature], dim=1)
+        # x = self.fc(x)
+# 
+        # return x
 
 
 # 4. 学習の実装
-def train(model, dataloader, optimizer, criterion, device):
+def train(model, dataloader, optimizer, criterion, device, train_dataset):
     model.train()
 
     total_loss = 0
@@ -354,10 +376,27 @@ def train(model, dataloader, optimizer, criterion, device):
 
     start = time.time()
     for image, question, answers, mode_answer in tqdm(dataloader):
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+        image = image.to(device).float()
+        answers = answers.to(device)
+        mode_answer = mode_answer.to(device)
 
-        pred = model(image, question)
+        # Clip image data to [0, 1]
+        image = torch.clamp(image, 0, 1)
+
+        # Convert question tensor to list of strings
+        # question = [' '.join([train_dataset.idx2question[int(idx)] for idx in q]) for q in question]
+        if isinstance(question[0], torch.Tensor):
+            processed_questions = [' '.join([train_dataset.idx2question.get(int(idx), '[UNK]') for idx in q if idx != 0]) for q in question]
+        else:
+            processed_questions = question
+
+        pred = model(image, processed_questions)
+
+    # for image, question, answers, mode_answer in tqdm(dataloader):
+    #     image, question, answer, mode_answer = \
+    #         image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+
+    #     pred = model(image, question)
         loss = criterion(pred, mode_answer.squeeze())
 
         optimizer.zero_grad()
@@ -371,19 +410,36 @@ def train(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
-def eval(model, dataloader, optimizer, criterion, device):
+def eval(model, dataloader, optimizer, criterion, device, test_dataset):
     model.eval()
 
-    # total_loss = 0
-    total_acc = 0
+    total_loss = 0
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+    for image, question, answers, mode_answer in tqdm(dataloader):
+        image = image.to(device)
+        answers = answers.to(device)
+        mode_answer = mode_answer.to(device)
+
+        # Clip image data to [0, 1]
+        image = torch.clamp(image, 0, 1)
+
+        # Convert question tensor to list of strings
+        question = [' '.join([test_dataset.idx2question[int(idx)] for idx in q]) for q in question]
 
         pred = model(image, question)
+
+    # # total_loss = 0
+    # total_acc = 0
+    # simple_acc = 0
+
+    # start = time.time()
+    # for image, question, answers, mode_answer in dataloader:
+    #     image, question, answer, mode_answer = \
+    #         image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+# 
+        # pred = model(image, question)
         loss = criterion(pred, mode_answer.squeeze())
 
         total_loss += loss.item()
@@ -412,30 +468,33 @@ def main():
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    # model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(device, train_dataset).to(device)
 
     # optimizer / criterion
     num_epoch = 10
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
 
     # train model
     for epoch in range(num_epoch):
-        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
+        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device, train_dataset)
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
               f"train loss: {train_loss:.4f}\n"
               f"train acc: {train_acc:.4f}"
             #   f"train simple acc: {train_simple_acc:.4f}"
               )
-        scheduler.step()
+        # scheduler.step()
 
     # 提出用ファイルの作成
     model.eval()
     submission = []
     for image, question in test_loader:
-        image, question = image.to(device), question.to(device)
+        # image, question = image.to(device), question.to(device)
+        # image, question = image.to(device).float(), question.to(device).float()  # Convert tensors to float32
+        image = image.to(device).float()
         pred = model(image, question)
         pred = pred.argmax(1).cpu().item()
         submission.append(pred)
@@ -447,4 +506,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
