@@ -1,6 +1,8 @@
 import re
 import random
 import time
+import json
+import os
 from statistics import mode
 
 from PIL import Image
@@ -48,20 +50,81 @@ def process_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+def create_custom_mapping(train_data_path, min_freq=10, max_classes=3000):
+    try:
+        if not os.path.exists(train_data_path):
+            raise FileNotFoundError(f"The file {train_data_path} does not exist.")
+        
+        with open(train_data_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        print(f"Type of loaded data: {type(data)}")
+        print("Keys in the loaded data:")
+        print(json.dumps(list(data.keys()), indent=2))
+        
+        all_answers = []
+        for img_id, answers in data['answers'].items():
+            if isinstance(answers, list):
+                all_answers.extend([ans['answer'].lower() for ans in answers if isinstance(ans, dict) and 'answer' in ans])
+        
+        if not all_answers:
+            print("Warning: No answers were found in the data.")
+            return None
+        
+        print(f"Total number of answers found: {len(all_answers)}")
+        print("Sample answers:")
+        print(all_answers[:10])
+        
+        answer_counts = Counter(all_answers)
+        
+        class_mapping = {
+            'unanswerable': 0,
+            'unusable image': 1,
+            'yes': 2,
+            'no': 3
+        }
+        
+        idx = len(class_mapping)
+        for answer, count in answer_counts.most_common():
+            if count >= min_freq and idx < max_classes:
+                if answer not in class_mapping:
+                    class_mapping[answer] = idx
+                    idx += 1
+        
+        class_mapping['[NUMBER]'] = idx
+        
+        print(f"Total number of classes: {len(class_mapping)}")
+        print("Sample of class mapping:")
+        print(json.dumps(dict(list(class_mapping.items())[:10]), indent=2))
+        
+        return class_mapping
+
+    except Exception as e:
+        print(f"An error occurred while processing the file: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 class VQADataset(Dataset):
     def __init__(self, df_path, image_dir, transform=None, answer=True, max_answers=10):
         self.transform = transform
         self.image_dir = image_dir
-        self.df = pd.read_json(df_path)
+        with open(df_path, 'r', encoding='utf-8') as f:
+            self.data = json.load(f)
         self.answer = answer
         self.max_answers = max_answers
+        self.image_ids = list(self.data['image'].keys())
+
+        print(f"Type of loaded data: {type(self.data)}")
+        print("Keys in the loaded data:")
+        print(json.dumps(list(self.data.keys()), indent=2))
 
         self.question2idx = {}
         self.answer2idx = {}
         self.idx2question = {}
         self.idx2answer = {}
 
-        for question in self.df["question"]:
+        for question in self.data['question'].values():
             question = process_text(question)
             words = question.split()
             for word in words:
@@ -69,51 +132,50 @@ class VQADataset(Dataset):
                     self.question2idx[word] = len(self.question2idx)
         self.idx2question = {v: k for k, v in self.question2idx.items()}
 
-        if self.answer and 'answers' in self.df.columns:
-            all_answers = [process_text(ans["answer"]) for answers in self.df["answers"] for ans in answers]
-            answer_counts = Counter(all_answers)
-            self.answer2idx = {ans: idx for idx, (ans, count) in enumerate(answer_counts.most_common()) if count >= 9}
+        if self.answer:
+            class_mapping_df = pd.read_csv("custom_class_mapping.csv")
+            self.answer2idx = {row["answer"]: row["class_id"] for _, row in class_mapping_df.iterrows()}
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}
 
             print(f"Number of unique answers: {len(self.answer2idx)}")
             print(f"Sample answers: {list(self.answer2idx.items())[:10]}")
 
     def __getitem__(self, idx):
-        image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
+        img_id = self.image_ids[idx]
+        image_path = f"{self.image_dir}/{self.data['image'][img_id]}"
+        question = self.data['question'][img_id]
+        
+        image = Image.open(image_path)
         image = self.transform(image) if self.transform else image
-        question = self.df["question"][idx]
 
-        if self.answer and 'answers' in self.df.columns:
-            answers = self.df["answers"][idx]
-            answer_indices = [self.answer2idx.get(process_text(ans["answer"]), -1) for ans in answers]
-            answer_indices = [idx for idx in answer_indices if idx != -1]
-            if not answer_indices:
-                answer_indices = [0]  # デフォルトの答えのインデックス
+        if self.answer:
+            answers = self.data['answers'].get(img_id, [])
+            answer_indices = []
+            for ans in answers:
+                processed_ans = process_text(ans['answer'])
+                if processed_ans.isdigit():
+                    answer_indices.append(self.answer2idx['[NUMBER]'])
+                else:
+                    answer_indices.append(self.answer2idx.get(processed_ans, self.answer2idx['unanswerable']))
             
-            # パディング
-            answer_indices = answer_indices[:self.max_answers]  # 最大数に切り詰め
-            answer_indices += [-1] * (self.max_answers - len(answer_indices))  # -1でパディング
+            answer_indices = answer_indices[:self.max_answers]
+            answer_indices += [-1] * (self.max_answers - len(answer_indices))
             
             mode_answer_idx = max(set(answer_indices), key=answer_indices.count)
             return image, question, torch.tensor(answer_indices), torch.tensor(mode_answer_idx)
         else:
-            return image, question
+            return image, question, torch.tensor([]), torch.tensor(-1)  # ダミーの answer_indices と mode_answer_idx を返す
 
     def __len__(self):
-        return len(self.df)
+        return len(self.image_ids)
 
 def collate_fn(batch):
-    images, questions, answers, mode_answers = zip(*batch)
+    images, questions, answer_indices, mode_answers = zip(*batch)
     images = torch.stack(images)
-    answers = torch.stack(answers)
+    questions = list(questions)  # questions are kept as a list of strings
+    answer_indices = torch.stack(answer_indices)
     mode_answers = torch.stack(mode_answers)
-    return images, questions, answers, mode_answers
-
-def VQA_score(pred, answers):
-    if pred in answers:
-        return min(answers.count(pred) / 3, 1)
-    else:
-        return 0
+    return images, questions, answer_indices, mode_answers
 
 class VQAModel(nn.Module):
     def __init__(self, device, num_answers):
@@ -130,7 +192,7 @@ class VQAModel(nn.Module):
     def forward(self, image, question):
         image = torch.clamp(image, 0, 1)
         
-        inputs = self.processor(text=question, images=image, return_tensors="pt", padding=True, truncation=True, max_length=77)
+        inputs = self.processor(text=question, images=image, return_tensors="pt", padding=True, truncation=True, max_length=77, do_rescale=False)
         inputs = {name: tensor.to(self.device) for name, tensor in inputs.items()}
         
         with torch.no_grad():
@@ -140,6 +202,12 @@ class VQAModel(nn.Module):
         logits = self.fc(image_features)
         
         return logits
+
+def VQA_score(pred, answers):
+    if pred in answers:
+        return min(answers.count(pred) / 3, 1)
+    else:
+        return 0
 
 def train(model, dataloader, optimizer, criterion, device, idx2answer):
     model.train()
@@ -158,6 +226,9 @@ def train(model, dataloader, optimizer, criterion, device, idx2answer):
 
         optimizer.zero_grad()
         loss.backward()
+        
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
 
         total_loss += loss.item()
@@ -166,7 +237,7 @@ def train(model, dataloader, optimizer, criterion, device, idx2answer):
         batch_vqa_score = 0
         for pred_ans, ans_list in zip(pred_answers, answers.cpu().numpy()):
             pred_ans_str = idx2answer[pred_ans]
-            ans_list_str = [idx2answer[a] for a in ans_list if a != -1]  # -1 (パディング) を除外
+            ans_list_str = [idx2answer[a] for a in ans_list if a != -1]
             batch_vqa_score += VQA_score(pred_ans_str, ans_list_str)
         total_vqa_score += batch_vqa_score / len(pred_answers)
         
@@ -186,12 +257,11 @@ def train(model, dataloader, optimizer, criterion, device, idx2answer):
 
 def eval(model, dataloader, criterion, device):
     model.eval()
-    total_loss = 0
     total_acc = 0
 
     start = time.time()
     with torch.no_grad():
-        for image, question in tqdm(dataloader):
+        for image, question, _, _ in tqdm(dataloader):
             image = image.to(device).float()
 
             pred = model(image, question)
@@ -206,6 +276,9 @@ def main():
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
+    # 環境変数を設定してトークナイザーの警告を抑制
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.RandomHorizontalFlip(),
@@ -214,11 +287,21 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     
+    # カスタムマッピングの作成
+    train_data_path = './data/train.json'
+    custom_mapping = create_custom_mapping(train_data_path)
+    if custom_mapping is None:
+        print("Failed to create custom mapping. Exiting.")
+        return
+
+    df = pd.DataFrame(list(custom_mapping.items()), columns=['answer', 'class_id'])
+    df.to_csv('custom_class_mapping.csv', index=False)
+    
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=collate_fn, num_workers=4)
 
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=collate_fn, num_workers=4)
 
     model = VQAModel(device, len(train_dataset.answer2idx)).to(device)
 
@@ -234,7 +317,6 @@ def main():
     num_epoch = 10
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-
     for epoch in range(num_epoch):
         train_loss, train_vqa_score, train_acc, train_time = train(model, train_loader, optimizer, criterion, device, train_dataset.idx2answer)
         eval_acc, eval_time = eval(model, test_loader, criterion, device)
@@ -247,15 +329,21 @@ def main():
     model.eval()
     submission = []
     with torch.no_grad():
-        for image, question in test_loader:
+        for image, question, _, _ in tqdm(test_loader, desc="Generating predictions"):
             image = image.to(device).float()
             pred = model(image, question)
             pred = pred.argmax(1).cpu().numpy()
             submission.extend([train_dataset.idx2answer[id] for id in pred])
 
     submission = np.array(submission)
-    torch.save(model.state_dict(), "model.pth")
-    np.save("submission.npy", submission)
+    
+    # モデルの保存
+    torch.save(model.state_dict(), "vizwiz_vqa_model.pth")
+    print("Model saved as 'vizwiz_vqa_model.pth'")
+    
+    # 予測結果の保存
+    np.save("vizwiz_vqa_submission.npy", submission)
+    print("Predictions saved as 'vizwiz_vqa_submission.npy'")
 
 if __name__ == "__main__":
     main()
