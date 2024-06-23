@@ -10,8 +10,10 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from collections import Counter
 from tqdm import tqdm
@@ -133,7 +135,7 @@ class VQADataset(Dataset):
         self.idx2question = {v: k for k, v in self.question2idx.items()}
 
         if self.answer:
-            class_mapping_df = pd.read_csv("custom_class_mapping.csv")
+            class_mapping_df = pd.read_csv("./data/custom_class_mapping.csv")
             self.answer2idx = {row["answer"]: row["class_id"] for _, row in class_mapping_df.iterrows()}
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}
 
@@ -177,7 +179,7 @@ def collate_fn(batch):
     mode_answers = torch.stack(mode_answers)
     return images, questions, answer_indices, mode_answers
 
-class VQAModel(nn.Module):
+class ImprovedVQAModel(nn.Module):
     def __init__(self, device, num_answers):
         super().__init__()
         self.device = device
@@ -187,7 +189,11 @@ class VQAModel(nn.Module):
         self.num_answers = num_answers
         print(f"Number of answer classes: {self.num_answers}")
 
-        self.fc = nn.Linear(self.clip_model.config.projection_dim, self.num_answers).to(device)
+        clip_dim = self.clip_model.config.projection_dim
+        self.attention = nn.MultiheadAttention(clip_dim, 8, batch_first=True)
+        self.fc1 = nn.Linear(clip_dim * 2, 512)
+        self.fc2 = nn.Linear(512, self.num_answers)
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, image, question):
         image = torch.clamp(image, 0, 1)
@@ -199,9 +205,25 @@ class VQAModel(nn.Module):
             clip_outputs = self.clip_model(**inputs)
         
         image_features = clip_outputs.image_embeds
-        logits = self.fc(image_features)
+        text_features = clip_outputs.text_embeds
+
+        # Apply attention mechanism
+        attn_output, _ = self.attention(image_features, text_features, text_features)
+        
+        # Concatenate attention output with image features
+        combined = torch.cat((attn_output, image_features), dim=1)
+        
+        x = F.relu(self.fc1(combined))
+        x = self.dropout(x)
+        logits = self.fc2(x)
         
         return logits
+
+def focal_loss(pred, target, gamma=2.0, alpha=0.25):
+    ce_loss = F.cross_entropy(pred, target, reduction='none')
+    pt = torch.exp(-ce_loss)
+    focal_loss = alpha * (1 - pt)**gamma * ce_loss
+    return focal_loss.mean()
 
 def VQA_score(pred, answers):
     if pred in answers:
@@ -209,7 +231,7 @@ def VQA_score(pred, answers):
     else:
         return 0
 
-def train(model, dataloader, optimizer, criterion, device, idx2answer):
+def train(model, dataloader, optimizer, scheduler, device, idx2answer):
     model.train()
     total_loss = 0
     total_vqa_score = 0
@@ -222,7 +244,7 @@ def train(model, dataloader, optimizer, criterion, device, idx2answer):
         mode_answer = mode_answer.to(device)
 
         pred = model(image, question)
-        loss = criterion(pred, mode_answer)
+        loss = focal_loss(pred, mode_answer)
 
         optimizer.zero_grad()
         loss.backward()
@@ -250,12 +272,13 @@ def train(model, dataloader, optimizer, criterion, device, idx2answer):
             print(f"Batch 0 - Loss: {loss.item()}")
 
     num_batches = len(dataloader)
+    scheduler.step()  # エポックごとにスケジューラを更新
     return (total_loss / num_batches, 
             total_vqa_score / num_batches, 
             total_acc / num_batches, 
             time.time() - start)
 
-def eval(model, dataloader, criterion, device):
+def eval(model, dataloader, device):
     model.eval()
     total_acc = 0
 
@@ -276,18 +299,17 @@ def main():
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
-    # 環境変数を設定してトークナイザーの警告を抑制
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     
-    # カスタムマッピングの作成
     train_data_path = './data/train.json'
     custom_mapping = create_custom_mapping(train_data_path)
     if custom_mapping is None:
@@ -295,15 +317,19 @@ def main():
         return
 
     df = pd.DataFrame(list(custom_mapping.items()), columns=['answer', 'class_id'])
-    df.to_csv('custom_class_mapping.csv', index=False)
+    df.to_csv('./data/custom_class_mapping.csv', index=False)
     
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=collate_fn, num_workers=4)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]), answer=False)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
-    model = VQAModel(device, len(train_dataset.answer2idx)).to(device)
+    model = ImprovedVQAModel(device, len(train_dataset.answer2idx)).to(device)
 
     print(f"Number of answers in dataset: {len(train_dataset.answer2idx)}")
     print(f"Sample answers: {list(train_dataset.answer2idx.items())[:10]}")
@@ -314,12 +340,13 @@ def main():
     print(f"Sample output shape: {sample_output.shape}")
     print(f"Sample output: {sample_output[0][:10]}")
 
-    num_epoch = 10
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    num_epoch = 20
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epoch)
+
     for epoch in range(num_epoch):
-        train_loss, train_vqa_score, train_acc, train_time = train(model, train_loader, optimizer, criterion, device, train_dataset.idx2answer)
-        eval_acc, eval_time = eval(model, test_loader, criterion, device)
+        train_loss, train_vqa_score, train_acc, train_time = train(model, train_loader, optimizer, scheduler, device, train_dataset.idx2answer)
+        eval_acc, eval_time = eval(model, test_loader, device)
         
         print(f"Epoch {epoch + 1}/{num_epoch}")
         print(f"Train - Loss: {train_loss:.4f}, VQA Score: {train_vqa_score:.4f}, Acc: {train_acc:.4f}, Time: {train_time:.2f}s")
@@ -333,17 +360,19 @@ def main():
             image = image.to(device).float()
             pred = model(image, question)
             pred = pred.argmax(1).cpu().numpy()
-            submission.extend([train_dataset.idx2answer[id] for id in pred])
+            submission.extend([
+                train_dataset.idx2answer[id] for id in pred
+            ])
 
     submission = np.array(submission)
     
     # モデルの保存
-    torch.save(model.state_dict(), "vizwiz_vqa_model.pth")
-    print("Model saved as 'vizwiz_vqa_model.pth'")
+    torch.save(model.state_dict(), "improved_model.pth")
+    print("Model saved as 'improved_model.pth'")
     
     # 予測結果の保存
-    np.save("vizwiz_vqa_submission.npy", submission)
-    print("Predictions saved as 'vizwiz_vqa_submission.npy'")
+    np.save("improved_submission.npy", submission)
+    print("Predictions saved as 'improved_submission.npy'")
 
 if __name__ == "__main__":
     main()
