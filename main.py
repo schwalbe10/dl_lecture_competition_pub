@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 from collections import Counter
 from tqdm import tqdm
@@ -147,7 +147,7 @@ class VQADataset(Dataset):
         image_path = f"{self.image_dir}/{self.data['image'][img_id]}"
         question = self.data['question'][img_id]
         
-        image = Image.open(image_path)
+        image = Image.open(image_path).convert('RGB')
         image = self.transform(image) if self.transform else image
 
         if self.answer:
@@ -166,7 +166,7 @@ class VQADataset(Dataset):
             mode_answer_idx = max(set(answer_indices), key=answer_indices.count)
             return image, question, torch.tensor(answer_indices), torch.tensor(mode_answer_idx)
         else:
-            return image, question, torch.tensor([]), torch.tensor(-1)  # ダミーの answer_indices と mode_answer_idx を返す
+            return image, question, torch.tensor([]), torch.tensor(-1)
 
     def __len__(self):
         return len(self.image_ids)
@@ -174,26 +174,38 @@ class VQADataset(Dataset):
 def collate_fn(batch):
     images, questions, answer_indices, mode_answers = zip(*batch)
     images = torch.stack(images)
-    questions = list(questions)  # questions are kept as a list of strings
+    questions = list(questions)
     answer_indices = torch.stack(answer_indices)
     mode_answers = torch.stack(mode_answers)
     return images, questions, answer_indices, mode_answers
 
-class ImprovedVQAModel(nn.Module):
+class EnhancedVQAModel(nn.Module):
     def __init__(self, device, num_answers):
         super().__init__()
         self.device = device
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
+        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
         
         self.num_answers = num_answers
-        print(f"Number of answer classes: {self.num_answers}")
-
         clip_dim = self.clip_model.config.projection_dim
-        self.attention = nn.MultiheadAttention(clip_dim, 8, batch_first=True)
-        self.fc1 = nn.Linear(clip_dim * 2, 512)
-        self.fc2 = nn.Linear(512, self.num_answers)
-        self.dropout = nn.Dropout(0.3)
+
+        self.cross_attention = nn.MultiheadAttention(clip_dim, 16, batch_first=True)
+        
+        self.fusion = nn.Sequential(
+            nn.Linear(clip_dim * 2, clip_dim),
+            nn.ReLU(),
+            nn.Linear(clip_dim, clip_dim)
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(clip_dim, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, self.num_answers)
+        )
 
     def forward(self, image, question):
         image = torch.clamp(image, 0, 1)
@@ -207,20 +219,16 @@ class ImprovedVQAModel(nn.Module):
         image_features = clip_outputs.image_embeds
         text_features = clip_outputs.text_embeds
 
-        # Apply attention mechanism
-        attn_output, _ = self.attention(image_features, text_features, text_features)
+        attn_output, _ = self.cross_attention(image_features, text_features, text_features)
         
-        # Concatenate attention output with image features
-        combined = torch.cat((attn_output, image_features), dim=1)
+        fused_features = self.fusion(torch.cat([attn_output, image_features], dim=-1))
         
-        x = F.relu(self.fc1(combined))
-        x = self.dropout(x)
-        logits = self.fc2(x)
+        logits = self.classifier(fused_features)
         
         return logits
 
-def focal_loss(pred, target, gamma=2.0, alpha=0.25):
-    ce_loss = F.cross_entropy(pred, target, reduction='none')
+def improved_focal_loss(pred, target, gamma=2.0, alpha=0.25, smooth=0.1):
+    ce_loss = F.cross_entropy(pred, target, reduction='none', label_smoothing=smooth)
     pt = torch.exp(-ce_loss)
     focal_loss = alpha * (1 - pt)**gamma * ce_loss
     return focal_loss.mean()
@@ -244,13 +252,11 @@ def train(model, dataloader, optimizer, scheduler, device, idx2answer):
         mode_answer = mode_answer.to(device)
 
         pred = model(image, question)
-        loss = focal_loss(pred, mode_answer)
+        loss = improved_focal_loss(pred, mode_answer, smooth=0.1)
 
         optimizer.zero_grad()
         loss.backward()
-        
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
         optimizer.step()
 
         total_loss += loss.item()
@@ -272,7 +278,7 @@ def train(model, dataloader, optimizer, scheduler, device, idx2answer):
             print(f"Batch 0 - Loss: {loss.item()}")
 
     num_batches = len(dataloader)
-    scheduler.step()  # エポックごとにスケジューラを更新
+    scheduler.step()
     return (total_loss / num_batches, 
             total_vqa_score / num_batches, 
             total_acc / num_batches, 
@@ -320,16 +326,16 @@ def main():
     df.to_csv('./data/custom_class_mapping.csv', index=False)
     
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ]), answer=False)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
-    model = ImprovedVQAModel(device, len(train_dataset.answer2idx)).to(device)
+    model = EnhancedVQAModel(device, len(train_dataset.answer2idx)).to(device)
 
     print(f"Number of answers in dataset: {len(train_dataset.answer2idx)}")
     print(f"Sample answers: {list(train_dataset.answer2idx.items())[:10]}")
@@ -340,10 +346,11 @@ def main():
     print(f"Sample output shape: {sample_output.shape}")
     print(f"Sample output: {sample_output[0][:10]}")
 
-    num_epoch = 20
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
-    scheduler = CosineAnnealingLR(optimizer, T_max=num_epoch)
+    num_epoch = 30
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
 
+    best_vqa_score = 0
     for epoch in range(num_epoch):
         train_loss, train_vqa_score, train_acc, train_time = train(model, train_loader, optimizer, scheduler, device, train_dataset.idx2answer)
         eval_acc, eval_time = eval(model, test_loader, device)
@@ -353,6 +360,12 @@ def main():
         print(f"Eval  - Acc: {eval_acc:.4f}, Time: {eval_time:.2f}s")
         print("-" * 50)
 
+        if train_vqa_score > best_vqa_score:
+            best_vqa_score = train_vqa_score
+            torch.save(model.state_dict(), "best_model.pth")
+            print(f"New best model saved with VQA Score: {best_vqa_score:.4f}")
+
+    model.load_state_dict(torch.load("best_model.pth"))
     model.eval()
     submission = []
     with torch.no_grad():
@@ -367,12 +380,12 @@ def main():
     submission = np.array(submission)
     
     # モデルの保存
-    torch.save(model.state_dict(), "improved_model.pth")
-    print("Model saved as 'improved_model.pth'")
+    torch.save(model.state_dict(), "final_model.pth")
+    print("Final model saved as 'final_model.pth'")
     
     # 予測結果の保存
-    np.save("improved_submission.npy", submission)
-    print("Predictions saved as 'improved_submission.npy'")
+    np.save("submission.npy", submission)
+    print("Predictions saved as 'submission.npy'")
 
 if __name__ == "__main__":
     main()
