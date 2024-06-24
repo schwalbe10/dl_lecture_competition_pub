@@ -52,7 +52,7 @@ def process_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def create_custom_mapping(train_data_path, min_freq=10, max_classes=3000):
+def create_custom_mapping(train_data_path, min_freq=5, max_classes=5000):
     try:
         if not os.path.exists(train_data_path):
             raise FileNotFoundError(f"The file {train_data_path} does not exist.")
@@ -60,22 +60,10 @@ def create_custom_mapping(train_data_path, min_freq=10, max_classes=3000):
         with open(train_data_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
-        print(f"Type of loaded data: {type(data)}")
-        print("Keys in the loaded data:")
-        print(json.dumps(list(data.keys()), indent=2))
-        
         all_answers = []
         for img_id, answers in data['answers'].items():
             if isinstance(answers, list):
-                all_answers.extend([ans['answer'].lower() for ans in answers if isinstance(ans, dict) and 'answer' in ans])
-        
-        if not all_answers:
-            print("Warning: No answers were found in the data.")
-            return None
-        
-        print(f"Total number of answers found: {len(all_answers)}")
-        print("Sample answers:")
-        print(all_answers[:10])
+                all_answers.extend([process_text(ans['answer']) for ans in answers if isinstance(ans, dict) and 'answer' in ans])
         
         answer_counts = Counter(all_answers)
         
@@ -94,10 +82,7 @@ def create_custom_mapping(train_data_path, min_freq=10, max_classes=3000):
                     idx += 1
         
         class_mapping['[NUMBER]'] = idx
-        
-        print(f"Total number of classes: {len(class_mapping)}")
-        print("Sample of class mapping:")
-        print(json.dumps(dict(list(class_mapping.items())[:10]), indent=2))
+        class_mapping['[OTHER]'] = idx + 1  # Add a catch-all category
         
         return class_mapping
 
@@ -117,10 +102,6 @@ class VQADataset(Dataset):
         self.max_answers = max_answers
         self.image_ids = list(self.data['image'].keys())
 
-        print(f"Type of loaded data: {type(self.data)}")
-        print("Keys in the loaded data:")
-        print(json.dumps(list(self.data.keys()), indent=2))
-
         self.question2idx = {}
         self.answer2idx = {}
         self.idx2question = {}
@@ -139,9 +120,6 @@ class VQADataset(Dataset):
             self.answer2idx = {row["answer"]: row["class_id"] for _, row in class_mapping_df.iterrows()}
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}
 
-            print(f"Number of unique answers: {len(self.answer2idx)}")
-            print(f"Sample answers: {list(self.answer2idx.items())[:10]}")
-
     def __getitem__(self, idx):
         img_id = self.image_ids[idx]
         image_path = f"{self.image_dir}/{self.data['image'][img_id]}"
@@ -150,23 +128,25 @@ class VQADataset(Dataset):
         image = Image.open(image_path).convert('RGB')
         image = self.transform(image) if self.transform else image
 
-        if self.answer:
+        if self.answer and 'answers' in self.data:
             answers = self.data['answers'].get(img_id, [])
             answer_indices = []
             for ans in answers:
                 processed_ans = process_text(ans['answer'])
                 if processed_ans.isdigit():
-                    answer_indices.append(self.answer2idx['[NUMBER]'])
+                    answer_indices.append(self.answer2idx.get('[NUMBER]', 0))
+                elif processed_ans in self.answer2idx:
+                    answer_indices.append(self.answer2idx[processed_ans])
                 else:
-                    answer_indices.append(self.answer2idx.get(processed_ans, self.answer2idx['unanswerable']))
+                    answer_indices.append(self.answer2idx.get('[OTHER]', 0))
             
             answer_indices = answer_indices[:self.max_answers]
-            answer_indices += [-1] * (self.max_answers - len(answer_indices))
+            answer_indices += [0] * (self.max_answers - len(answer_indices))
             
-            mode_answer_idx = max(set(answer_indices), key=answer_indices.count)
+            mode_answer_idx = max(set(answer_indices), key=answer_indices.count) if answer_indices else 0
             return image, question, torch.tensor(answer_indices), torch.tensor(mode_answer_idx)
         else:
-            return image, question, torch.tensor([]), torch.tensor(-1)
+            return image, question, torch.tensor([0] * self.max_answers), torch.tensor(0)
 
     def __len__(self):
         return len(self.image_ids)
@@ -271,12 +251,6 @@ def train(model, dataloader, optimizer, scheduler, device, idx2answer):
         
         total_acc += (pred.argmax(1) == mode_answer).float().mean().item()
 
-        if batch_idx == 0:
-            print(f"Batch 0 - pred shape: {pred.shape}, mode_answer shape: {mode_answer.shape}")
-            print(f"Batch 0 - pred sample: {pred[0][:10]}")
-            print(f"Batch 0 - mode_answer sample: {mode_answer[0]}")
-            print(f"Batch 0 - Loss: {loss.item()}")
-
     num_batches = len(dataloader)
     scheduler.step()
     return (total_loss / num_batches, 
@@ -284,22 +258,58 @@ def train(model, dataloader, optimizer, scheduler, device, idx2answer):
             total_acc / num_batches, 
             time.time() - start)
 
-def eval(model, dataloader, device):
+def eval(model, dataloader, device, idx2answer):
     model.eval()
+    total_loss = 0
+    total_vqa_score = 0
     total_acc = 0
 
     start = time.time()
     with torch.no_grad():
-        for image, question, _, _ in tqdm(dataloader):
+        for image, question, answers, mode_answer in tqdm(dataloader):
             image = image.to(device).float()
+            answers = answers.to(device)
+            mode_answer = mode_answer.to(device)
 
             pred = model(image, question)
+            loss = improved_focal_loss(pred, mode_answer, smooth=0.1)
+
+            total_loss += loss.item()
             
-            total_acc += pred.argmax(1).float().mean().item()
+            pred_answers = pred.argmax(1).cpu().numpy()
+            batch_vqa_score = 0
+            for pred_ans, ans_list in zip(pred_answers, answers.cpu().numpy()):
+                pred_ans_str = idx2answer[pred_ans]
+                ans_list_str = [idx2answer[a] for a in ans_list if a != -1]
+                batch_vqa_score += VQA_score(pred_ans_str, ans_list_str)
+            total_vqa_score += batch_vqa_score / len(pred_answers)
+            
+            total_acc += (pred.argmax(1) == mode_answer).float().mean().item()
 
     num_batches = len(dataloader)
-    return (total_acc / num_batches, 
+    return (total_loss / num_batches,
+            total_vqa_score / num_batches,
+            total_acc / num_batches,
             time.time() - start)
+
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, score):
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
 
 def main():
     set_seed(42)
@@ -312,12 +322,14 @@ def main():
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+        transforms.RandomPerspective(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     
     train_data_path = './data/train.json'
-    custom_mapping = create_custom_mapping(train_data_path)
+    custom_mapping = create_custom_mapping(train_data_path, min_freq=5, max_classes=5000)
     if custom_mapping is None:
         print("Failed to create custom mapping. Exiting.")
         return
@@ -326,44 +338,44 @@ def main():
     df.to_csv('./data/custom_class_mapping.csv', index=False)
     
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+
+    val_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ]), answer=False)
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
     model = EnhancedVQAModel(device, len(train_dataset.answer2idx)).to(device)
 
-    print(f"Number of answers in dataset: {len(train_dataset.answer2idx)}")
-    print(f"Sample answers: {list(train_dataset.answer2idx.items())[:10]}")
-
-    sample_image, sample_question, sample_answers, sample_mode_answer = next(iter(train_loader))
-    sample_image = sample_image.to(device).float()
-    sample_output = model(sample_image, sample_question)
-    print(f"Sample output shape: {sample_output.shape}")
-    print(f"Sample output: {sample_output[0][:10]}")
-
-    num_epoch = 30
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
+    num_epoch = 100  # Set a high number, early stopping will prevent overfitting
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    early_stopping = EarlyStopping(patience=10, min_delta=0.001)
 
     best_vqa_score = 0
     for epoch in range(num_epoch):
         train_loss, train_vqa_score, train_acc, train_time = train(model, train_loader, optimizer, scheduler, device, train_dataset.idx2answer)
-        eval_acc, eval_time = eval(model, test_loader, device)
+        val_loss, val_vqa_score, val_acc, val_time = eval(model, val_loader, device, train_dataset.idx2answer)
         
         print(f"Epoch {epoch + 1}/{num_epoch}")
         print(f"Train - Loss: {train_loss:.4f}, VQA Score: {train_vqa_score:.4f}, Acc: {train_acc:.4f}, Time: {train_time:.2f}s")
-        print(f"Eval  - Acc: {eval_acc:.4f}, Time: {eval_time:.2f}s")
+        print(f"Val   - Loss: {val_loss:.4f}, VQA Score: {val_vqa_score:.4f}, Acc: {val_acc:.4f}, Time: {val_time:.2f}s")
         print("-" * 50)
 
-        if train_vqa_score > best_vqa_score:
-            best_vqa_score = train_vqa_score
+        if val_vqa_score > best_vqa_score:
+            best_vqa_score = val_vqa_score
             torch.save(model.state_dict(), "best_model.pth")
             print(f"New best model saved with VQA Score: {best_vqa_score:.4f}")
+
+        early_stopping(val_vqa_score)
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
 
     model.load_state_dict(torch.load("best_model.pth"))
     model.eval()
@@ -379,11 +391,9 @@ def main():
 
     submission = np.array(submission)
     
-    # モデルの保存
     torch.save(model.state_dict(), "final_model.pth")
     print("Final model saved as 'final_model.pth'")
     
-    # 予測結果の保存
     np.save("submission.npy", submission)
     print("Predictions saved as 'submission.npy'")
 
