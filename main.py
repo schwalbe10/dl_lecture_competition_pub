@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import OneCycleLR
 
 from collections import Counter
 from tqdm import tqdm
@@ -35,21 +35,25 @@ def process_text(text):
     num_word_to_digit = {
         'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
         'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
-        'ten': '10'
+        'ten': '10', 'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14',
+        'fifteen': '15', 'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19',
+        'twenty': '20', 'thirty': '30', 'forty': '40', 'fifty': '50',
+        'sixty': '60', 'seventy': '70', 'eighty': '80', 'ninety': '90'
     }
     for word, digit in num_word_to_digit.items():
         text = text.replace(word, digit)
-    text = re.sub(r'(?<!\d)\.(?!\d)', '', text)
-    text = re.sub(r'\b(a|an|the)\b', '', text)
+    
+    text = re.sub(r'[^\w\s\']', ' ', text)
+    
     contractions = {
-        "dont": "don't", "isnt": "isn't", "arent": "aren't", "wont": "won't",
-        "cant": "can't", "wouldnt": "wouldn't", "couldnt": "couldn't"
+        "n't": " not", "'s": " is", "'re": " are", "'d": " would",
+        "'ll": " will", "'ve": " have", "'m": " am"
     }
-    for contraction, correct in contractions.items():
-        text = text.replace(contraction, correct)
-    text = re.sub(r"[^\w\s':]", ' ', text)
-    text = re.sub(r'\s+,', ',', text)
+    for contraction, expansion in contractions.items():
+        text = text.replace(contraction, expansion)
+    
     text = re.sub(r'\s+', ' ', text).strip()
+    
     return text
 
 def create_custom_mapping(train_data_path, min_freq=5, max_classes=5000):
@@ -82,7 +86,7 @@ def create_custom_mapping(train_data_path, min_freq=5, max_classes=5000):
                     idx += 1
         
         class_mapping['[NUMBER]'] = idx
-        class_mapping['[OTHER]'] = idx + 1  # Add a catch-all category
+        class_mapping['[OTHER]'] = idx + 1
         
         return class_mapping
 
@@ -169,12 +173,16 @@ class EnhancedVQAModel(nn.Module):
         self.num_answers = num_answers
         clip_dim = self.clip_model.config.projection_dim
 
-        self.cross_attention = nn.MultiheadAttention(clip_dim, 16, batch_first=True)
+        self.cross_attention1 = nn.MultiheadAttention(clip_dim, 16, batch_first=True)
+        self.cross_attention2 = nn.MultiheadAttention(clip_dim, 16, batch_first=True)
         
         self.fusion = nn.Sequential(
             nn.Linear(clip_dim * 2, clip_dim),
+            nn.LayerNorm(clip_dim),
             nn.ReLU(),
-            nn.Linear(clip_dim, clip_dim)
+            nn.Linear(clip_dim, clip_dim),
+            nn.LayerNorm(clip_dim),
+            nn.ReLU()
         )
         
         self.classifier = nn.Sequential(
@@ -199,19 +207,26 @@ class EnhancedVQAModel(nn.Module):
         image_features = clip_outputs.image_embeds
         text_features = clip_outputs.text_embeds
 
-        attn_output, _ = self.cross_attention(image_features, text_features, text_features)
+        attn_output1, _ = self.cross_attention1(image_features, text_features, text_features)
+        attn_output2, _ = self.cross_attention2(attn_output1, text_features, text_features)
         
-        fused_features = self.fusion(torch.cat([attn_output, image_features], dim=-1))
+        fused_features = self.fusion(torch.cat([attn_output2, image_features], dim=-1))
         
         logits = self.classifier(fused_features)
         
         return logits
 
-def improved_focal_loss(pred, target, gamma=2.0, alpha=0.25, smooth=0.1):
+def improved_loss(pred, target, gamma=2.0, alpha=0.25, smooth=0.1, kl_weight=0.1):
     ce_loss = F.cross_entropy(pred, target, reduction='none', label_smoothing=smooth)
     pt = torch.exp(-ce_loss)
     focal_loss = alpha * (1 - pt)**gamma * ce_loss
-    return focal_loss.mean()
+    
+    soft_target = F.one_hot(target, num_classes=pred.size(1)).float()
+    soft_target = soft_target * (1 - smooth) + smooth / pred.size(1)
+    log_pred = F.log_softmax(pred, dim=1)
+    kl_div = F.kl_div(log_pred, soft_target, reduction='batchmean')
+    
+    return focal_loss.mean() + kl_weight * kl_div
 
 def VQA_score(pred, answers):
     if pred in answers:
@@ -232,12 +247,13 @@ def train(model, dataloader, optimizer, scheduler, device, idx2answer):
         mode_answer = mode_answer.to(device)
 
         pred = model(image, question)
-        loss = improved_focal_loss(pred, mode_answer, smooth=0.1)
+        loss = improved_loss(pred, mode_answer)
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
 
         total_loss += loss.item()
         
@@ -252,7 +268,6 @@ def train(model, dataloader, optimizer, scheduler, device, idx2answer):
         total_acc += (pred.argmax(1) == mode_answer).float().mean().item()
 
     num_batches = len(dataloader)
-    scheduler.step()
     return (total_loss / num_batches, 
             total_vqa_score / num_batches, 
             total_acc / num_batches, 
@@ -272,7 +287,7 @@ def eval(model, dataloader, device, idx2answer):
             mode_answer = mode_answer.to(device)
 
             pred = model(image, question)
-            loss = improved_focal_loss(pred, mode_answer, smooth=0.1)
+            loss = improved_loss(pred, mode_answer)
 
             total_loss += loss.item()
             
@@ -324,6 +339,12 @@ def main():
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
         transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
         transforms.RandomPerspective(),
+        transforms.ToTensor,
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    test_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -340,29 +361,29 @@ def main():
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
-    val_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform)
+    val_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]), answer=False)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=test_transform, answer=False)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
     model = EnhancedVQAModel(device, len(train_dataset.answer2idx)).to(device)
 
-    num_epoch = 100  # Set a high number, early stopping will prevent overfitting
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    num_epochs = 100  # Increased number of epochs
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    
+    # Using OneCycleLR scheduler
+    steps_per_epoch = len(train_loader)
+    scheduler = OneCycleLR(optimizer, max_lr=1e-4, epochs=num_epochs, steps_per_epoch=steps_per_epoch)
+
     early_stopping = EarlyStopping(patience=10, min_delta=0.001)
 
     best_vqa_score = 0
-    for epoch in range(num_epoch):
+    for epoch in range(num_epochs):
         train_loss, train_vqa_score, train_acc, train_time = train(model, train_loader, optimizer, scheduler, device, train_dataset.idx2answer)
         val_loss, val_vqa_score, val_acc, val_time = eval(model, val_loader, device, train_dataset.idx2answer)
         
-        print(f"Epoch {epoch + 1}/{num_epoch}")
+        print(f"Epoch {epoch + 1}/{num_epochs}")
         print(f"Train - Loss: {train_loss:.4f}, VQA Score: {train_vqa_score:.4f}, Acc: {train_acc:.4f}, Time: {train_time:.2f}s")
         print(f"Val   - Loss: {val_loss:.4f}, VQA Score: {val_vqa_score:.4f}, Acc: {val_acc:.4f}, Time: {val_time:.2f}s")
         print("-" * 50)
