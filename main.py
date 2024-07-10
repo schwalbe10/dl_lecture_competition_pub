@@ -18,7 +18,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from collections import Counter
 from tqdm import tqdm
 
-from transformers import CLIPProcessor, CLIPModel
+from transformers import CLIPProcessor, CLIPModel, BertTokenizer, BertModel
 
 def set_seed(seed):
     random.seed(seed)
@@ -102,7 +102,7 @@ class VQADataset(Dataset):
         self.image_dir = image_dir
         with open(df_path, 'r', encoding='utf-8') as f:
             self.data = json.load(f)
-        self.answer = answer
+        self.answer = answer and 'answers' in self.data  # 'answers' キーの存在を確認
         self.max_answers = max_answers
         self.image_ids = list(self.data['image'].keys())
 
@@ -147,10 +147,17 @@ class VQADataset(Dataset):
             answer_indices = answer_indices[:self.max_answers]
             answer_indices += [0] * (self.max_answers - len(answer_indices))
             
+<<<<<<< HEAD
             mode_answer_idx = max(set(answer_indices), key=answer_indices.count) if answer_indices else 0
             return image, question, torch.tensor(answer_indices), torch.tensor(mode_answer_idx)
         else:
             return image, question, torch.tensor([0] * self.max_answers), torch.tensor(0)
+=======
+            mode_answer_idx = max(set(answer_indices), key=answer_indices.count) if answer_indices else -1
+            return image, question, torch.tensor(answer_indices), torch.tensor(mode_answer_idx)
+        else:
+            return image, question, torch.tensor([]), torch.tensor(-1)
+>>>>>>> 9f89d53 (0.48522841618031703)
 
     def __len__(self):
         return len(self.image_ids)
@@ -163,14 +170,22 @@ def collate_fn(batch):
     mode_answers = torch.stack(mode_answers)
     return images, questions, answer_indices, mode_answers
 
+<<<<<<< HEAD
 class EnhancedVQAModel(nn.Module):
+=======
+class ImprovedVQAModel(nn.Module):
+>>>>>>> 9f89d53 (0.48522841618031703)
     def __init__(self, device, num_answers):
         super().__init__()
         self.device = device
         self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
         self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
         
+        self.bert_model = BertModel.from_pretrained('bert-base-uncased').to(device)
+        self.bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        
         self.num_answers = num_answers
+<<<<<<< HEAD
         clip_dim = self.clip_model.config.projection_dim
 
         self.cross_attention1 = nn.MultiheadAttention(clip_dim, 16, batch_first=True)
@@ -187,24 +202,40 @@ class EnhancedVQAModel(nn.Module):
         
         self.classifier = nn.Sequential(
             nn.Linear(clip_dim, 1024),
+=======
+        
+        self.fusion = nn.Sequential(
+            nn.Linear(self.clip_model.config.projection_dim + self.bert_model.config.hidden_size, 1024),
+>>>>>>> 9f89d53 (0.48522841618031703)
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(1024, 512),
             nn.ReLU(),
+<<<<<<< HEAD
             nn.Dropout(0.3),
             nn.Linear(512, self.num_answers)
         )
+=======
+            nn.Dropout(0.5),
+            nn.Linear(512, self.num_answers)
+        ).to(device)
+>>>>>>> 9f89d53 (0.48522841618031703)
 
     def forward(self, image, question):
         image = torch.clamp(image, 0, 1)
         
-        inputs = self.processor(text=question, images=image, return_tensors="pt", padding=True, truncation=True, max_length=77, do_rescale=False)
-        inputs = {name: tensor.to(self.device) for name, tensor in inputs.items()}
+        clip_inputs = self.processor(text=question, images=image, return_tensors="pt", padding=True, truncation=True, max_length=77, do_rescale=False)
+        clip_inputs = {name: tensor.to(self.device) for name, tensor in clip_inputs.items()}
+        
+        bert_inputs = self.bert_tokenizer(question, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        bert_inputs = {name: tensor.to(self.device) for name, tensor in bert_inputs.items()}
         
         with torch.no_grad():
-            clip_outputs = self.clip_model(**inputs)
+            clip_outputs = self.clip_model(**clip_inputs)
+            bert_outputs = self.bert_model(**bert_inputs)
         
         image_features = clip_outputs.image_embeds
+<<<<<<< HEAD
         text_features = clip_outputs.text_embeds
 
         attn_output1, _ = self.cross_attention1(image_features, text_features, text_features)
@@ -213,6 +244,12 @@ class EnhancedVQAModel(nn.Module):
         fused_features = self.fusion(torch.cat([attn_output2, image_features], dim=-1))
         
         logits = self.classifier(fused_features)
+=======
+        text_features = bert_outputs.last_hidden_state[:, 0, :]  # CLS token
+        
+        combined_features = torch.cat((image_features, text_features), dim=1)
+        logits = self.fusion(combined_features)
+>>>>>>> 9f89d53 (0.48522841618031703)
         
         return logits
 
@@ -273,11 +310,17 @@ def train(model, dataloader, optimizer, scheduler, device, idx2answer):
             total_acc / num_batches, 
             time.time() - start)
 
+<<<<<<< HEAD
 def eval(model, dataloader, device, idx2answer):
     model.eval()
     total_loss = 0
     total_vqa_score = 0
     total_acc = 0
+=======
+def eval(model, dataloader, device):
+    model.eval()
+    predictions = []
+>>>>>>> 9f89d53 (0.48522841618031703)
 
     start = time.time()
     with torch.no_grad():
@@ -287,6 +330,7 @@ def eval(model, dataloader, device, idx2answer):
             mode_answer = mode_answer.to(device)
 
             pred = model(image, question)
+<<<<<<< HEAD
             loss = improved_loss(pred, mode_answer)
 
             total_loss += loss.item()
@@ -306,6 +350,11 @@ def eval(model, dataloader, device, idx2answer):
             total_vqa_score / num_batches,
             total_acc / num_batches,
             time.time() - start)
+=======
+            predictions.extend(pred.argmax(1).cpu().numpy())
+
+    return predictions, time.time() - start
+>>>>>>> 9f89d53 (0.48522841618031703)
 
 class EarlyStopping:
     def __init__(self, patience=5, min_delta=0):
@@ -337,6 +386,7 @@ def main():
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+<<<<<<< HEAD
         transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
         transforms.RandomPerspective(),
         transforms.ToTensor,
@@ -345,6 +395,8 @@ def main():
 
     test_transform = transforms.Compose([
         transforms.Resize((224, 224)),
+=======
+>>>>>>> 9f89d53 (0.48522841618031703)
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -359,6 +411,7 @@ def main():
     df.to_csv('./data/custom_class_mapping.csv', index=False)
     
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
+<<<<<<< HEAD
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
     val_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=True)
@@ -386,8 +439,39 @@ def main():
         print(f"Epoch {epoch + 1}/{num_epochs}")
         print(f"Train - Loss: {train_loss:.4f}, VQA Score: {train_vqa_score:.4f}, Acc: {train_acc:.4f}, Time: {train_time:.2f}s")
         print(f"Val   - Loss: {val_loss:.4f}, VQA Score: {val_vqa_score:.4f}, Acc: {val_acc:.4f}, Time: {val_time:.2f}s")
-        print("-" * 50)
+=======
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn, num_workers=4)
 
+    val_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=4)
+
+    model = ImprovedVQAModel(device, len(train_dataset.answer2idx)).to(device)
+
+    num_epochs = 20
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    best_train_acc = 0
+    for epoch in range(num_epochs):
+        train_loss, train_vqa_score, train_acc, train_time = train(model, train_loader, optimizer, criterion, device, train_dataset.idx2answer)
+        val_predictions, val_time = eval(model, val_loader, device)
+        
+        scheduler.step()
+        
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+        print(f"Train - Loss: {train_loss:.4f}, VQA Score: {train_vqa_score:.4f}, Acc: {train_acc:.4f}, Time: {train_time:.2f}s")
+        print(f"Val   - Time: {val_time:.2f}s")
+>>>>>>> 9f89d53 (0.48522841618031703)
+        print("-" * 50)
+        
+        # Save the best model based on training accuracy
+        if train_acc > best_train_acc:
+            best_train_acc = train_acc
+            torch.save(model.state_dict(), "best_vizwiz_vqa_model.pth")
+            print("New best model saved!")
+
+<<<<<<< HEAD
         if val_vqa_score > best_vqa_score:
             best_vqa_score = val_vqa_score
             torch.save(model.state_dict(), "best_model.pth")
@@ -417,6 +501,18 @@ def main():
     
     np.save("submission.npy", submission)
     print("Predictions saved as 'submission.npy'")
+=======
+    # Load the best model for final prediction
+    model.load_state_dict(torch.load("best_vizwiz_vqa_model.pth"))
+    model.eval()
+    
+    # Final prediction generation
+    val_predictions, _ = eval(model, val_loader, device)
+    submission = [train_dataset.idx2answer[pred] for pred in val_predictions]
+
+    np.save("vizwiz_vqa_submission.npy", submission)
+    print("Predictions saved as 'vizwiz_vqa_submission.npy'")
+>>>>>>> 9f89d53 (0.48522841618031703)
 
 if __name__ == "__main__":
     main()
