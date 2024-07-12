@@ -13,11 +13,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
 
 from collections import Counter
 from tqdm import tqdm
 
 from transformers import CLIPProcessor, CLIPModel, BertTokenizer, BertModel
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+from nltk.tokenize import word_tokenize
+import nltk
+nltk.download('punkt', quiet=True)
 
 def set_seed(seed):
     random.seed(seed)
@@ -50,6 +56,11 @@ def process_text(text):
     text = re.sub(r'\s+,', ',', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+def advanced_process_text(text):
+    text = process_text(text)
+    tokens = word_tokenize(text)
+    return ' '.join(tokens)
 
 def create_custom_mapping(train_data_path, min_freq=10, max_classes=3000):
     try:
@@ -106,7 +117,7 @@ def create_custom_mapping(train_data_path, min_freq=10, max_classes=3000):
         traceback.print_exc()
         return None
 
-class VQADataset(Dataset):
+class AdvancedVQADataset(Dataset):
     def __init__(self, df_path, image_dir, transform=None, answer=True, max_answers=10):
         self.transform = transform
         self.image_dir = image_dir
@@ -125,8 +136,9 @@ class VQADataset(Dataset):
         self.idx2question = {}
         self.idx2answer = {}
 
-        for question in self.data['question'].values():
-            question = process_text(question)
+        for img_id in self.data['question']:
+            self.data['question'][img_id] = advanced_process_text(self.data['question'][img_id])
+            question = self.data['question'][img_id]
             words = question.split()
             for word in words:
                 if word not in self.question2idx:
@@ -146,7 +158,7 @@ class VQADataset(Dataset):
         image_path = f"{self.image_dir}/{self.data['image'][img_id]}"
         question = self.data['question'][img_id]
         
-        image = Image.open(image_path)
+        image = Image.open(image_path).convert('RGB')
         image = self.transform(image) if self.transform else image
 
         if self.answer:
@@ -178,48 +190,68 @@ def collate_fn(batch):
     mode_answers = torch.stack(mode_answers)
     return images, questions, answer_indices, mode_answers
 
-class ImprovedVQAModel(nn.Module):
+class AdvancedVQAModel(nn.Module):
     def __init__(self, device, num_answers):
         super().__init__()
         self.device = device
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
+        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
         
-        self.bert_model = BertModel.from_pretrained('bert-base-uncased').to(device)
-        self.bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.bert_model = BertModel.from_pretrained('bert-large-uncased').to(device)
+        self.bert_tokenizer = BertTokenizer.from_pretrained('bert-large-uncased')
         
         self.num_answers = num_answers
         
-        self.fusion = nn.Sequential(
-            nn.Linear(self.clip_model.config.projection_dim + self.bert_model.config.hidden_size, 1024),
-            nn.ReLU(),
-            nn.Dropout(0.5),
+        # Projection layers
+        self.clip_projection = nn.Linear(self.clip_model.config.projection_dim, 1024).to(device)
+        self.bert_projection = nn.Linear(self.bert_model.config.hidden_size, 1024).to(device)
+        
+        # Multi-modal Transformer
+        self.multimodal_transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=1024, nhead=8, dim_feedforward=2048, dropout=0.1),
+            num_layers=4
+        ).to(device)
+        
+        # Output layer
+        self.output_layer = nn.Sequential(
             nn.Linear(1024, 512),
             nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Dropout(0.3),
             nn.Linear(512, self.num_answers)
         ).to(device)
 
     def forward(self, image, question):
+        # 画像の値を[0, 1]の範囲に収める
         image = torch.clamp(image, 0, 1)
         
-        clip_inputs = self.processor(text=question, images=image, return_tensors="pt", padding=True, truncation=True, max_length=77, do_rescale=False)
-        clip_inputs = {name: tensor.to(self.device) for name, tensor in clip_inputs.items()}
+        # CLIPの前処理を手動で行う
+        image = self.processor.image_processor.preprocess(image, return_tensors="pt")["pixel_values"].to(self.device)
         
-        bert_inputs = self.bert_tokenizer(question, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        bert_inputs = {name: tensor.to(self.device) for name, tensor in bert_inputs.items()}
+        # テキストの処理
+        text_inputs = self.processor.tokenizer(question, padding=True, truncation=True, max_length=77, return_tensors="pt").to(self.device)
         
+        # CLIPモデルに入力
         with torch.no_grad():
-            clip_outputs = self.clip_model(**clip_inputs)
+            clip_outputs = self.clip_model(input_ids=text_inputs.input_ids, attention_mask=text_inputs.attention_mask, pixel_values=image)
+        
+        # BERTの処理
+        bert_inputs = self.bert_tokenizer(question, return_tensors="pt", padding=True, truncation=True, max_length=128).to(self.device)
+        with torch.no_grad():
             bert_outputs = self.bert_model(**bert_inputs)
         
-        image_features = clip_outputs.image_embeds
-        text_features = bert_outputs.last_hidden_state[:, 0, :]  # CLS token
+        image_features = self.clip_projection(clip_outputs.image_embeds)
+        text_features = self.bert_projection(bert_outputs.last_hidden_state)
         
-        combined_features = torch.cat((image_features, text_features), dim=1)
-        logits = self.fusion(combined_features)
+        # Combine features
+        combined_features = torch.cat([image_features.unsqueeze(1), text_features], dim=1)
         
-        return logits
+        # Pass through multi-modal transformer
+        transformed_features = self.multimodal_transformer(combined_features)
+        
+        # Get output
+        output = self.output_layer(transformed_features.mean(dim=1))
+        
+        return output
 
 def VQA_score(pred, answers):
     if pred in answers:
@@ -227,27 +259,28 @@ def VQA_score(pred, answers):
     else:
         return 0
 
-def train(model, dataloader, optimizer, criterion, device, idx2answer):
+def train(model, dataloader, optimizer, criterion, device, idx2answer, scheduler, scaler):
     model.train()
     total_loss = 0
     total_vqa_score = 0
     total_acc = 0
 
-    start = time.time()
     for batch_idx, (image, question, answers, mode_answer) in enumerate(tqdm(dataloader)):
         image = image.to(device).float()
         answers = answers.to(device)
         mode_answer = mode_answer.to(device)
 
-        pred = model(image, question)
-        loss = criterion(pred, mode_answer)
-
         optimizer.zero_grad()
-        loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
+
+        with autocast():
+            pred = model(image, question)
+            loss = criterion(pred, mode_answer)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        scheduler.step()
 
         total_loss += loss.item()
         
@@ -264,14 +297,12 @@ def train(model, dataloader, optimizer, criterion, device, idx2answer):
     num_batches = len(dataloader)
     return (total_loss / num_batches, 
             total_vqa_score / num_batches, 
-            total_acc / num_batches, 
-            time.time() - start)
+            total_acc / num_batches)
 
 def eval(model, dataloader, device):
     model.eval()
     predictions = []
 
-    start = time.time()
     with torch.no_grad():
         for image, question, _, _ in tqdm(dataloader):
             image = image.to(device).float()
@@ -279,7 +310,7 @@ def eval(model, dataloader, device):
             pred = model(image, question)
             predictions.extend(pred.argmax(1).cpu().numpy())
 
-    return predictions, time.time() - start
+    return predictions
 
 def main():
     set_seed(42)
@@ -287,13 +318,17 @@ def main():
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+    # Advanced data augmentation
+    advanced_transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.RandomCrop((224, 224)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+        transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
+        transforms.RandomGrayscale(p=0.1),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     
     train_data_path = './data/train.json'
@@ -305,43 +340,64 @@ def main():
     df = pd.DataFrame(list(custom_mapping.items()), columns=['answer', 'class_id'])
     df.to_csv('./data/custom_class_mapping.csv', index=False)
     
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
+    train_dataset = AdvancedVQADataset(df_path="./data/train.json", image_dir="./data/train", transform=advanced_transform)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn, num_workers=4)
 
-    val_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+    val_dataset = AdvancedVQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=advanced_transform, answer=False)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=4)
 
-    model = ImprovedVQAModel(device, len(train_dataset.answer2idx)).to(device)
+    model = AdvancedVQAModel(device, len(train_dataset.answer2idx)).to(device)
 
-    num_epochs = 20
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    num_epochs = 30
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
+    scaler = GradScaler()
 
-    best_train_acc = 0
+    best_val_score = float('-inf')
+    patience = 5
+    patience_counter = 0
+    best_model_path = "best_vizwiz_vqa_model.pth"
+
     for epoch in range(num_epochs):
-        train_loss, train_vqa_score, train_acc, train_time = train(model, train_loader, optimizer, criterion, device, train_dataset.idx2answer)
-        val_predictions, val_time = eval(model, val_loader, device)
+        train_loss, train_vqa_score, train_acc = train(model, train_loader, optimizer, criterion, device, train_dataset.idx2answer, scheduler, scaler)
+        val_predictions = eval(model, val_loader, device)
         
-        scheduler.step()
+        # バリデーションスコアの計算（実際のVQAスコア計算に置き換えてください）
+        val_score = sum(val_predictions) / len(val_predictions)
         
         print(f"Epoch {epoch + 1}/{num_epochs}")
-        print(f"Train - Loss: {train_loss:.4f}, VQA Score: {train_vqa_score:.4f}, Acc: {train_acc:.4f}, Time: {train_time:.2f}s")
-        print(f"Val   - Time: {val_time:.2f}s")
+        print(f"Train - Loss: {train_loss:.4f}, VQA Score: {train_vqa_score:.4f}, Acc: {train_acc:.4f}")
+        print(f"Val   - Score: {val_score:.4f}")
         print("-" * 50)
         
-        # Save the best model based on training accuracy
-        if train_acc > best_train_acc:
-            best_train_acc = train_acc
-            torch.save(model.state_dict(), "best_vizwiz_vqa_model.pth")
-            print("New best model saved!")
+        # 毎エポックでモデルを保存
+        torch.save(model.state_dict(), f"vizwiz_vqa_model_epoch_{epoch+1}.pth")
+        print(f"Model saved for epoch {epoch+1}")
 
-    # Load the best model for final prediction
-    model.load_state_dict(torch.load("best_vizwiz_vqa_model.pth"))
+        # Early Stopping
+        if val_score > best_val_score:
+            best_val_score = val_score
+            patience_counter = 0
+            torch.save(model.state_dict(), best_model_path)
+            print("New best model saved!")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {epoch + 1} epochs")
+                break
+
+    # 最良のモデルをロード（ファイルが存在する場合）
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path))
+        print(f"Loaded best model from {best_model_path}")
+    else:
+        print(f"Best model file {best_model_path} not found. Using the last trained model.")
+
     model.eval()
     
     # Final prediction generation
-    val_predictions, _ = eval(model, val_loader, device)
+    val_predictions = eval(model, val_loader, device)
     submission = [train_dataset.idx2answer[pred] for pred in val_predictions]
 
     np.save("vizwiz_vqa_submission.npy", submission)
