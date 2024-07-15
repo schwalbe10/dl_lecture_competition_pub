@@ -4,3 +4,5 @@ data/
 models/
 submissions/
 outputs/
+report.*
+markdown-pdf.css
