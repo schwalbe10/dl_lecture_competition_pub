@@ -1,4 +1,6 @@
 .DS_Store
+archive/
 data/
-model/
-submission/
+models/
+submissions/
+outputs/
